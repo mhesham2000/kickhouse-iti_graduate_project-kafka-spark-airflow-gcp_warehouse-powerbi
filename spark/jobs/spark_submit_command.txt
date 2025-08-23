@@ -1,0 +1,5 @@
+# Last working one
+spark-submit \
+  --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.4.2,\
+org.apache.spark:spark-token-provider-kafka-0-10_2.12:3.4.2 \
+  /opt/bitnami/spark/app/validate_json.py

@@ -1,0 +1,339 @@
+---
+services:
+
+#####################################################
+#### Airflow Services ###############################
+#####################################################
+
+  db:
+    container_name: postgres_airflow
+    image: postgres:15.13
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./postgres/data:/var/lib/postgresql/data
+      # - ./postgres/airflow_init.sql:/docker-entrypoint-initdb.d/airflow_init.sql
+      # networks:
+      #   - my_network
+
+  af:
+    container_name: airflow
+    build: ./airflow
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@db:5432/airflow_db
+      # _PIP_ADDITIONAL_REQUIREMENTS: "kafka-python duckdb pandas pyarrow"
+      AIRFLOW_EMAIL__EMAIL_BACKEND: airflow.utils.email.send_email_smtp
+      AIRFLOW__SMTP__SMTP_HOST: smtp.gmail.com
+      AIRFLOW__SMTP__SMTP_STARTTLS: True
+      AIRFLOW__SMTP__SMTP_SSL: False
+
+      # Use your preferred email and password here
+      AIRFLOW__SMTP__SMTP_USER:
+      AIRFLOW__SMTP__SMTP_PASSWORD:
+      AIRFLOW__SMTP__SMTP_PORT: 587
+      AIRFLOW__SMTP__SMTP_MAIL_FROM:
+      AIRFLOW__SMTP__SMTP_SSL_CERT_REQS: none
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+
+    ports:
+      - "9050:8080"
+    depends_on:
+      - db
+    volumes:
+      # Dags Directory
+      - ./airflow/dags:/opt/airflow/dags
+
+      # Producers Files
+      - ./producers:/opt/airflow/producers
+      - ./secrets:/opt/airflow/secrets
+      - ./config:/opt/airflow/config
+
+      # Data Dump Script -> Parquet
+      - ./airflow/scripts:/opt/airflow/scripts
+
+      - /var/run/docker.sock:/var/run/docker.sock
+
+    group_add:
+      - 1001
+      # networks:
+      #   - my_network
+    command: >
+      bash -c "sleep 10 && airflow db migrate && airflow standalone"
+
+
+#####################################################
+#### Grafana Monitoring #############################
+#####################################################
+  grafana:
+    image: grafana/grafana:latest-ubuntu
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=motherduck-duckdb-datasource
+      - GF_SMTP_ENABLED=true
+      - GF_SMTP_HOST=smtp.gmail.com:587
+      - GF_SMTP_SKIP_VERIFY=true
+      - GF_SMTP_PASSWORD=lidkzolkshbitbym 
+      - GF_SMTP_USER=sportsdb90@gmail.com
+      - GF_SMTP_FROM_ADDRESS=sportsdb90@gmail.com
+      - GF_SMTP_FROM_NAME=Grafana
+      - GF_SMTP_STARTTLS_POLICY=Opportunistic
+    volumes:
+      # Persist Grafana Data
+      - ./grafana/data:/var/lib/grafana
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards
+
+      # MotherDuck
+      - ./grafana/plugins/motherduck-duckdb-datasource:/var/lib/grafana/plugins/motherduck-duckdb-datasource
+
+      # Parquet File
+      - ./airflow/dags/data:/data
+
+    restart: unless-stopped
+
+#####################################################
+#### Kafka Cluster ##################################
+#####################################################
+  broker:
+    image: confluentinc/cp-kafka:7.6.1
+    hostname: broker
+    container_name: broker
+    ports:
+      - "9092:9092"
+      - "9094:9094"        # ← exposes the SASL/PLAIN listener
+      - "9095:9095"          # ← SASL_SSL  (for ClickPipe)
+      - "9101:9101"
+      - "1234:1234"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: >-
+        INTERNAL:PLAINTEXT,
+        EXTERNAL:SASL_PLAINTEXT,
+        EXTERNALSASL:SASL_PLAINTEXT,
+        EXTERNALTLS:SASL_SSL,
+        CONTROLLER:PLAINTEXT
+      KAFKA_LISTENERS: >-
+        INTERNAL://broker:29092,
+        EXTERNAL://0.0.0.0:9092,
+        EXTERNALSASL://0.0.0.0:9094,
+        EXTERNALTLS://0.0.0.0:9095,
+        CONTROLLER://broker:29093
+      KAFKA_ADVERTISED_LISTENERS: >-
+        INTERNAL://broker:29092,
+        EXTERNAL://${EXT_PLAIN_HOST}:${EXT_PLAIN_PORT},
+        EXTERNALSASL://${EXT_SASL_HOST}:${EXT_SASL_PORT},
+        EXTERNALTLS://${TLS_HOST}:${TLS_PORT}
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'INTERNAL'
+      
+      KAFKA_SSL_KEYSTORE_TYPE:    JKS
+      KAFKA_SSL_TRUSTSTORE_TYPE:  JKS
+      KAFKA_SSL_KEYSTORE_LOCATION: /etc/kafka/secrets/kafka.keystore.jks
+      KAFKA_SSL_KEYSTORE_PASSWORD: m3troctyKafka2025
+      KAFKA_SSL_KEY_PASSWORD:      m3troctyKafka2025
+      KAFKA_SSL_TRUSTSTORE_LOCATION: /etc/kafka/secrets/kafka.truststore.jks
+      KAFKA_SSL_TRUSTSTORE_PASSWORD: m3troctyKafka2025
+
+      ##  enable SASL/PLAIN on the new listener
+      KAFKA_SASL_ENABLED_MECHANISMS: 'PLAIN'
+      KAFKA_SASL_MECHANISM_INTER_BROKER_PROTOCOL: 'PLAIN'
+      KAFKA_OPTS: >-
+        -Djava.security.auth.login.config=/etc/kafka/jaas.conf
+        -javaagent:/tmp/jmx/jmx_prometheus_javaagent.jar=1234:/tmp/jmx/broker.yml
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_JMX_PORT: 9101
+      KAFKA_JMX_HOSTNAME: localhost
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@broker:29093'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_LOG_DIRS: '/tmp/kraft-combined-logs'
+      # Replace CLUSTER_ID with a unique base64 UUID using "bin/kafka-storage.sh random-uuid" 
+      # See https://docs.confluent.io/kafka/operations-tools/kafka-tools.html#kafka-storage-sh
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+      #https://medium.com/@oredata-engineering/setting-up-prometheus-grafana-for-kafka-on-docker-8a692a45966c
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: "2g"
+        reservations:
+          cpus: '1'
+          memory: "2g"
+    volumes:
+      - $PWD/secrets:/etc/kafka/secrets:ro
+      - $PWD/jmx-exporter:/tmp/jmx/
+      - $PWD/kafka_server_jaas.conf:/etc/kafka/jaas.conf:ro
+
+  kafka-ui:
+    container_name: kafka-ui
+    image: provectuslabs/kafka-ui:latest
+    platform: linux/amd64
+    ports:
+      - 8090:8080
+    depends_on:
+      - broker
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: broker:29092
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: "1g"
+        reservations:
+          cpus: '0.5'
+          memory: "1g"
+
+
+#####################################################
+#### Spark Cluster ##################################
+#####################################################
+
+  spark-master:
+    image: yourorg/spark-custom:3.4.2 
+    build: .
+    pull_policy: never
+    container_name: spark-master
+    environment:
+      - SPARK_MODE=master
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    ports:
+      - "8082:8060"   # Spark Web UI
+      - "7077:7077"   # Spark master port
+      - "4043:4040"   # Spark Driver UI
+    volumes:
+      - ./spark/jobs:/opt/bitnami/spark/app
+      - ./logs:/logs:rw
+      - ./secrets:/opt/secrets:ro
+    networks:
+      - default
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: '8g'
+        reservations:
+          cpus: '2'
+          memory: '8g'
+
+  spark-worker-1:
+    image: yourorg/spark-custom:3.4.2 
+    build: .
+    pull_policy: never
+    container_name: spark-worker-1
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=1
+    depends_on:
+      - spark-master
+    ports:
+      - "8084:8082"  # Spark worker UI
+    volumes:
+      - ./spark/jobs:/opt/bitnami/spark/app
+      - ./secrets:/opt/secrets:ro
+    networks:
+      - default
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: '2g'
+        reservations:
+          cpus: '1'
+          memory: '2g'
+
+  spark-worker-2:
+    image: yourorg/spark-custom:3.4.2 
+    build: .
+    pull_policy: never
+    container_name: spark-worker-2
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=1
+    depends_on:
+      - spark-master
+    ports:
+      - "8075:8082"  # Spark worker UI
+    volumes:
+      - ./spark/jobs:/opt/bitnami/spark/app
+      - ./secrets:/opt/secrets:ro
+    networks:
+      - default
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: '2g'
+        reservations:
+          cpus: '1'
+          memory: '2g'
+
+  spark-worker-3:
+    image: yourorg/spark-custom:3.4.2 
+    build: .
+    pull_policy: never
+    container_name: spark-worker-3
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=1
+    depends_on:
+      - spark-master
+    ports:
+      - "8086:8082"  # Spark worker UI
+    volumes:
+      - ./spark/jobs:/opt/bitnami/spark/app
+      - ./secrets:/opt/secrets:ro
+    networks:
+      - default
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: '2g'
+        reservations:
+          cpus: '1'
+          memory: '2g'
+
+  spark-worker-4:
+    image: yourorg/spark-custom:3.4.2 
+    build: .
+    pull_policy: never
+    container_name: spark-worker-4
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=1
+    depends_on:
+      - spark-master
+    ports:
+      - "8088:8082"  # Spark worker UI
+    volumes:
+      - ./spark/jobs:/opt/bitnami/spark/app
+      - ./secrets:/opt/secrets:ro
+    networks:
+      - default
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: '2g'
+        reservations:
+          cpus: '1'
+          memory: '2g'
