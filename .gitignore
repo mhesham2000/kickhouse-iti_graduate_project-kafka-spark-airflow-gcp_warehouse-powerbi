@@ -14,6 +14,7 @@ venv/
 # -----------------------------
 # Environment & Secrets
 # -----------------------------
+kafka_server_jaas.conf
 .env
 .env.*
 config/.env
@@ -51,7 +52,7 @@ derby.log
 # -----------------------------
 # Data outputs (keep samples in a dedicated folder and un-ignore if needed)
 # -----------------------------
-*.parquet
+# *.parquet
 *.orc
 *.avro
 *.snappy
