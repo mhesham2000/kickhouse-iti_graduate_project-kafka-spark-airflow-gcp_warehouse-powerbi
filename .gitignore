@@ -81,3 +81,12 @@ node_modules/
 # Docker/Compose local volumes (if you use a host dir)
 # -----------------------------
 volumes/
+
+
+# -----------------------------
+# Data files
+# -----------------------------
+grafana/data
+grafana/dashboards
+
+postgres
