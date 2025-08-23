@@ -1,0 +1,82 @@
+# -----------------------------
+# Python
+# -----------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+*.dist-info/
+.venv/
+venv/
+
+# -----------------------------
+# Environment & Secrets
+# -----------------------------
+.env
+.env.*
+config/.env
+config/.env.*
+secrets/
+secrets/**
+*.key
+*.pem
+*.crt
+*.csr
+*.jks
+*.p12
+*.pfx
+*.der
+
+# -----------------------------
+# Airflow
+# -----------------------------
+airflow/standalone_*.txt
+airflow/airflow-webserver.pid
+airflow/airflow.cfg
+airflow/logs/
+airflow/dags/data/kafka_invalid/
+logs/
+
+# -----------------------------
+# Spark
+# -----------------------------
+checkpoints/
+spark/checkpoints/
+spark-warehouse/
+derby.log
+.metastore_db/
+
+# -----------------------------
+# Data outputs (keep samples in a dedicated folder and un-ignore if needed)
+# -----------------------------
+*.parquet
+*.orc
+*.avro
+*.snappy
+*.log
+
+# -----------------------------
+# Notebooks
+# -----------------------------
+.ipynb_checkpoints/
+
+# -----------------------------
+# Editors/IDEs
+# -----------------------------
+.vscode/
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+
+# -----------------------------
+# Node / Frontend (if any dashboards/tools)
+# -----------------------------
+node_modules/
+
+# -----------------------------
+# Docker/Compose local volumes (if you use a host dir)
+# -----------------------------
+volumes/
