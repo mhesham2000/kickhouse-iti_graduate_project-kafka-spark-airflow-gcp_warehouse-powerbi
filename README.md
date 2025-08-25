@@ -359,7 +359,7 @@ If you see cluster metadata, TLS + SASL works. If you get certificate errors, en
 
 ### 9) Create kafka_server_jaas.conf file at project root directory
 Use the same SASL password you used in the previous steps, in my case it's `clickpipe-secret`. Following is an example of how it looks like:
-```JSON
+```
 KafkaServer {
   org.apache.kafka.common.security.plain.PlainLoginModule required
     user_clickpipe="clickpipe-secret";
