@@ -1,0 +1,613 @@
+/* ============================================================
+   0) DATABASE
+   Purpose: isolate the BI warehouse (Power BI points here)
+   ============================================================ */
+CREATE DATABASE IF NOT EXISTS dw;
+
+
+/* ============================================================
+   1) DIMENSIONS  (Type-1 SCD via ReplacingMergeTree(updated_at))
+   Purpose: conformed lookup tables; small & stable for slicers.
+   Keys: *_sk = cityHash64(Int64 natural keys), deterministic.
+   Modeling: relate dims → facts (Single direction) in Power BI.
+   ============================================================ */
+
+/* ---------- League (from default.raw_league) ---------- */
+CREATE TABLE IF NOT EXISTS dw.dim_league (
+  -- Surrogate key (deterministic): used for relationships in BI
+  league_sk           UInt64        DEFAULT cityHash64(idLeague),
+
+  -- Natural key
+  idLeague            Int64,
+
+  -- Attributes
+  strLeague           LowCardinality(String),
+  strLeagueAlternate  LowCardinality(Nullable(String)),
+  strSport            LowCardinality(String),
+  strCountry          LowCardinality(Nullable(String)),
+  strGender           LowCardinality(String),
+  strCurrentSeason    LowCardinality(String),
+  intFormedYear       Nullable(Int64),
+  badge_url           LowCardinality(Nullable(String)),
+  logo_url            LowCardinality(Nullable(String)),
+  banner_url          LowCardinality(Nullable(String)),
+
+  -- Type-1 control (last write wins by ORDER BY key)
+  updated_at          DateTime64(3)
+) ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY (idLeague);
+
+/* ---------- Team (from default.raw_team) ---------- */
+CREATE TABLE IF NOT EXISTS dw.dim_team (
+  team_sk             UInt64        DEFAULT cityHash64(idTeam),
+  idTeam              Int64,
+  strTeam             LowCardinality(Nullable(String)),
+  strTeamShort        LowCardinality(Nullable(String)),
+  country             LowCardinality(Nullable(String)),
+  -- flattened league memberships (idLeague..idLeague7)
+  league_ids          Array(Nullable(Int64)),
+  strStadium          LowCardinality(Nullable(String)),
+  intStadiumCapacity  Nullable(Int64),
+  formed_year         Nullable(Int64),
+  website             LowCardinality(Nullable(String)),
+  badge_url           LowCardinality(Nullable(String)),
+  logo_url            LowCardinality(Nullable(String)),
+  banner_url          LowCardinality(Nullable(String)),
+  updated_at          DateTime64(3)
+) ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY (idTeam);
+
+/* ---------- Player (from default.raw_player) ---------- */
+CREATE TABLE IF NOT EXISTS dw.dim_player (
+  player_sk           UInt64        DEFAULT cityHash64(idPlayer),
+  idPlayer            Int64,
+  idTeam              Int64,
+  strPlayer           LowCardinality(String),
+  strNumber           LowCardinality(Nullable(String)),
+  strPosition         LowCardinality(String),
+  nationality         LowCardinality(Nullable(String)),
+  dateBorn            Date,
+  thumb_url           LowCardinality(Nullable(String)),
+  cutout_url          LowCardinality(Nullable(String)),
+  updated_at          DateTime64(3)
+) ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY (idPlayer);
+
+/* ---------- Venue (from default.raw_venue) ---------- */
+CREATE TABLE IF NOT EXISTS dw.dim_venue (
+  venue_sk            UInt64        DEFAULT cityHash64(idVenue),
+  idVenue             Int64,
+  strVenue            LowCardinality(Nullable(String)),
+  strLocation         LowCardinality(Nullable(String)),
+  strCountry          LowCardinality(Nullable(String)),
+  intCapacity         Nullable(Int64),
+  strTimezone         LowCardinality(Nullable(String)),
+  thumb_url           LowCardinality(Nullable(String)),
+  logo_url            LowCardinality(Nullable(String)),
+  map_url             LowCardinality(Nullable(String)),
+  updated_at          DateTime64(3)
+) ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY (idVenue);
+
+/* ---------- Channel (from default.raw_daily_channel) ---------- */
+CREATE TABLE IF NOT EXISTS dw.dim_channel (
+  channel_sk          UInt64        DEFAULT cityHash64(idChannel),
+  idChannel           Int64,
+  strChannel          LowCardinality(Nullable(String)),
+  strCountry          LowCardinality(Nullable(String)),
+  strLogo             LowCardinality(Nullable(String)),
+  updated_at          DateTime64(3)
+) ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY (idChannel);
+
+
+/* ============================================================
+   2) FACTS
+   Purpose: analytical grains for events, timelines, lineups,
+            live snapshots, broadcasts & highlights.
+   Notes:
+   - fact_event: schedule/result row per event. Includes strEvent,
+     and scheduled_date alias for easy Date joins in DirectQuery.
+   - *_snapshot/stats use MergeTree (append-heavy).
+   ============================================================ */
+
+/* ---------- fact_event (from default.raw_event) ---------- */
+CREATE TABLE IF NOT EXISTS dw.fact_event
+(
+  idEvent             Int64,                       -- natural event key
+  league_sk           UInt64,
+  home_team_sk        UInt64,
+  away_team_sk        UInt64,
+  venue_sk            Nullable(UInt64),
+
+  season              LowCardinality(String),
+  round               Nullable(Int64),
+  status_final        LowCardinality(String),
+  result              LowCardinality(Nullable(String)),
+  strEvent            LowCardinality(Nullable(String)) DEFAULT NULL,  -- title/name
+
+  event_date          Date,
+  scheduled_utc       DateTime64(9),
+  kickoff_local_utc   Nullable(DateTime64(9)),
+
+  home_score          Nullable(Int64),
+  away_score          Nullable(Int64),
+  thumb_url           LowCardinality(Nullable(String)),
+
+  created_at          DateTime64(3),
+  updated_at          DateTime64(3),
+
+  -- Convenience for BI (DQ-safe; used in relationships)
+  scheduled_date      Date ALIAS toDate(scheduled_utc)
+)
+ENGINE = SharedReplacingMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}', updated_at)
+PARTITION BY toYYYYMM(event_date)
+ORDER BY (event_date, league_sk, idEvent)
+SETTINGS index_granularity = 8192;
+
+/* ---------- fact_event_snapshot (from default.raw_livescore) ---------- */
+CREATE TABLE IF NOT EXISTS dw.fact_event_snapshot (
+  idEvent             Int64,
+  snapshot_ts         DateTime64(9),
+  league_sk           UInt64,
+  home_team_sk        UInt64,
+  away_team_sk        UInt64,
+  status              LowCardinality(String),
+  progress            Nullable(Int64),
+  home_score          Int64,
+  away_score          Int64,
+  total_score         Nullable(Int64)
+) ENGINE = MergeTree
+PARTITION BY toYYYYMM(snapshot_ts)
+ORDER BY (idEvent, snapshot_ts);
+
+/* ---------- fact_event_stat (from default.raw_event_stats) ---------- */
+CREATE TABLE IF NOT EXISTS dw.fact_event_stat (
+  idEvent             Int64,
+  stat_code           LowCardinality(String),
+  home_value          Nullable(Int64),
+  away_value          Nullable(Int64),
+  asof_ts             DateTime64(3)
+) ENGINE = MergeTree
+PARTITION BY toYYYYMM(asof_ts)
+ORDER BY (idEvent, stat_code);
+
+/* ---------- fact_timeline (from default.raw_event_timeline) ---------- */
+CREATE TABLE IF NOT EXISTS dw.fact_timeline (
+  idTimeline          Int64,
+  idEvent             Int64,
+  minute              Nullable(Int64),
+  timeline_type       LowCardinality(String),
+  detail              LowCardinality(String),
+  team_sk             Nullable(UInt64),
+  player_sk           Nullable(UInt64),
+  assist_player_sk    Nullable(UInt64),
+  comment             Nullable(String),
+  event_date          Date,
+  asof_ts             DateTime64(3)
+) ENGINE = MergeTree
+PARTITION BY toYYYYMM(event_date)
+-- Avoid "nullable key" error by normalizing minute in ORDER BY
+ORDER BY (idEvent, ifNull(minute, toInt64(-1)), idTimeline);
+
+/* ---------- fact_lineup (from default.raw_event_lineup) ---------- */
+CREATE TABLE IF NOT EXISTS dw.fact_lineup (
+  idEvent             Int64,
+  team_sk             UInt64,
+  player_sk           UInt64,
+  position            LowCardinality(String),
+  position_short      LowCardinality(String),
+  is_substitute       UInt8,
+  squad_number        Nullable(Int64),
+  asof_ts             DateTime64(3)
+) ENGINE = MergeTree
+PARTITION BY toYYYYMM(asof_ts)
+ORDER BY (idEvent, team_sk, player_sk);
+
+/* ---------- fact_broadcast (from default.raw_daily_channel) ---------- */
+CREATE TABLE IF NOT EXISTS dw.fact_broadcast (
+  idEvent             Int64,
+  channel_sk          UInt64,
+  country             LowCardinality(Nullable(String)),
+  event_date          Date,
+  asof_ts             DateTime64(3)
+) ENGINE = MergeTree
+PARTITION BY toYYYYMM(event_date)
+ORDER BY (idEvent, channel_sk, ifNull(country, ''));
+
+/* ---------- fact_highlight (from default.raw_event_highlights) ---------- */
+CREATE TABLE IF NOT EXISTS dw.fact_highlight (
+  idEvent             Int64,
+  media_type          LowCardinality(String),
+  url                 String,
+  asof_ts             DateTime64(3)
+) ENGINE = MergeTree
+PARTITION BY toYYYYMM(asof_ts)
+ORDER BY (idEvent, media_type, url);
+
+
+/* ============================================================
+   3) MATERIALIZED VIEWS (stream soccer-only into DW tables)
+   Purpose: keep DW live as raw_* ingest; no POPULATE here.
+   If you change a SELECT list, DROP the MV then CREATE again.
+   ============================================================ */
+
+/* ---------- dim_league MV ---------- */
+CREATE MATERIALIZED VIEW IF NOT EXISTS dw.mv_dim_league
+TO dw.dim_league AS
+SELECT
+  cityHash64(idLeague)                       AS league_sk,
+  idLeague,
+  strLeague,
+  strLeagueAlternate,
+  strSport,
+  strCountry,
+  strGender,
+  strCurrentSeason,
+  intFormedYear,
+  strBadge                                    AS badge_url,
+  strLogo                                     AS logo_url,
+  strBanner                                   AS banner_url,
+  now64(3)                                    AS updated_at
+FROM default.raw_league
+WHERE lowerUTF8(trim(strSport)) = 'soccer';
+
+/* ---------- dim_team MV ---------- */
+CREATE MATERIALIZED VIEW IF NOT EXISTS dw.mv_dim_team
+TO dw.dim_team AS
+SELECT
+  cityHash64(idTeam)                          AS team_sk,
+  idTeam,
+  strTeam,
+  strTeamShort,
+  strCountry                                  AS country,
+  [idLeague, idLeague2, idLeague3, idLeague4, idLeague5, idLeague6, idLeague7] AS league_ids,
+  strStadium,
+  intStadiumCapacity,
+  intFormedYear                               AS formed_year,
+  strWebsite                                  AS website,
+  strBadge                                    AS badge_url,
+  strLogo                                     AS logo_url,
+  strBanner                                   AS banner_url,
+  now64(3)                                    AS updated_at
+FROM default.raw_team
+WHERE lowerUTF8(trim(strSport)) = 'soccer';
+
+/* ---------- dim_player MV ---------- */
+CREATE MATERIALIZED VIEW IF NOT EXISTS dw.mv_dim_player
+TO dw.dim_player AS
+SELECT
+  cityHash64(idPlayer)                         AS player_sk,
+  idPlayer,
+  idTeam,
+  strPlayer,
+  strNumber,
+  strPosition,
+  strNationality                               AS nationality,
+  dateBorn,
+  strThumb                                     AS thumb_url,
+  strCutout                                    AS cutout_url,
+  now64(3)                                     AS updated_at
+FROM default.raw_player
+WHERE lowerUTF8(trim(strSport)) = 'soccer';
+
+/* ---------- dim_venue MV ---------- */
+CREATE MATERIALIZED VIEW IF NOT EXISTS dw.mv_dim_venue
+TO dw.dim_venue AS
+SELECT
+  cityHash64(idVenue)                          AS venue_sk,
+  idVenue,
+  strVenue,
+  strLocation,
+  strCountry,
+  intCapacity,
+  strTimezone,
+  strThumb                                     AS thumb_url,
+  strLogo                                      AS logo_url,
+  strMap                                       AS map_url,
+  now64(3)                                     AS updated_at
+FROM default.raw_venue
+WHERE lowerUTF8(trim(strSport)) = 'soccer';
+
+/* ---------- dim_channel MV ---------- */
+CREATE MATERIALIZED VIEW IF NOT EXISTS dw.mv_dim_channel
+TO dw.dim_channel AS
+SELECT
+  cityHash64(idChannel)                        AS channel_sk,
+  idChannel,
+  anyLast(strChannel)                          AS strChannel,
+  anyLast(strCountry)                          AS strCountry,
+  anyLast(strLogo)                             AS strLogo,
+  now64(3)                                     AS updated_at
+FROM default.raw_daily_channel
+WHERE lowerUTF8(trim(strSport)) = 'soccer' AND idChannel != 0
+GROUP BY idChannel;
+
+/* ---------- fact_event MV (includes strEvent; fallback for scheduled_utc) ---------- */
+CREATE MATERIALIZED VIEW IF NOT EXISTS dw.mv_fact_event
+TO dw.fact_event AS
+SELECT
+  idEvent,
+  cityHash64(idLeague)                         AS league_sk,
+  cityHash64(idHomeTeam)                       AS home_team_sk,
+  cityHash64(idAwayTeam)                       AS away_team_sk,
+  if(ifNull(idVenue, 0) = 0, NULL, cityHash64(idVenue)) AS venue_sk,
+  strSeason                                    AS season,
+  intRound                                     AS round,
+  strStatus                                    AS status_final,
+  strResult                                    AS result,
+  strEvent                                     AS strEvent,
+  dateEvent                                    AS event_date,
+  coalesce(strTimestamp, toDateTime64(dateEvent, 9))    AS scheduled_utc,
+  CAST(NULL AS Nullable(DateTime64(9)))        AS kickoff_local_utc,
+  intHomeScore                                 AS home_score,
+  intAwayScore                                 AS away_score,
+  strThumb                                     AS thumb_url,
+  now64(3)                                     AS created_at,
+  now64(3)                                     AS updated_at
+FROM default.raw_event
+WHERE lowerUTF8(trim(strSport)) = 'soccer';
+
+/* ---------- fact_event_snapshot MV ---------- */
+CREATE MATERIALIZED VIEW IF NOT EXISTS dw.mv_fact_event_snapshot
+TO dw.fact_event_snapshot AS
+SELECT
+  idEvent,
+  updated                                      AS snapshot_ts,
+  cityHash64(idLeague)                         AS league_sk,
+  cityHash64(idHomeTeam)                       AS home_team_sk,
+  cityHash64(idAwayTeam)                       AS away_team_sk,
+  strStatus                                    AS status,
+  strProgress                                  AS progress,
+  intHomeScore                                 AS home_score,
+  intAwayScore                                 AS away_score,
+  if(isNull(intHomeScore) OR isNull(intAwayScore), NULL, intHomeScore + intAwayScore) AS total_score
+FROM default.raw_livescore
+WHERE lowerUTF8(trim(strSport)) = 'soccer';
+
+/* ---------- fact_event_stat MV ---------- */
+CREATE MATERIALIZED VIEW IF NOT EXISTS dw.mv_fact_event_stat
+TO dw.fact_event_stat AS
+SELECT
+  s.idEvent,
+  s.strStat                                    AS stat_code,
+  s.intHome                                    AS home_value,
+  s.intAway                                    AS away_value,
+  now64(3)                                     AS asof_ts
+FROM default.raw_event_stats AS s
+INNER JOIN default.raw_event AS e USING (idEvent)
+WHERE lowerUTF8(trim(e.strSport)) = 'soccer';
+
+/* ---------- fact_timeline MV ---------- */
+CREATE MATERIALIZED VIEW IF NOT EXISTS dw.mv_fact_timeline
+TO dw.fact_timeline AS
+SELECT
+  t.idTimeline,
+  t.idEvent,
+  t.intTime                                    AS minute,
+  t.strTimeline                                AS timeline_type,
+  t.strTimelineDetail                          AS detail,
+  if(t.idTeam   = 0, NULL, cityHash64(t.idTeam))   AS team_sk,
+  if(t.idPlayer = 0, NULL, cityHash64(t.idPlayer)) AS player_sk,
+  if(t.idAssist = 0, NULL, cityHash64(t.idAssist)) AS assist_player_sk,
+  t.strComment                                 AS comment,
+  t.dateEvent                                  AS event_date,
+  now64(3)                                     AS asof_ts
+FROM default.raw_event_timeline AS t
+INNER JOIN default.raw_event       AS e USING (idEvent)
+WHERE lowerUTF8(trim(e.strSport)) = 'soccer';
+
+/* ---------- fact_lineup MV ---------- */
+CREATE MATERIALIZED VIEW IF NOT EXISTS dw.mv_fact_lineup
+TO dw.fact_lineup AS
+SELECT
+  l.idEvent,
+  cityHash64(l.idTeam)                          AS team_sk,
+  cityHash64(l.idPlayer)                        AS player_sk,
+  l.strPosition                                 AS position,
+  l.strPositionShort                            AS position_short,
+  if(lowerUTF8(trim(l.strSubstitute))='yes', 1, 0) AS is_substitute,
+  l.intSquadNumber                              AS squad_number,
+  now64(3)                                      AS asof_ts
+FROM default.raw_event_lineup AS l
+INNER JOIN default.raw_event    AS e USING (idEvent)
+WHERE lowerUTF8(trim(e.strSport)) = 'soccer';
+
+/* ---------- fact_broadcast MV ---------- */
+CREATE MATERIALIZED VIEW IF NOT EXISTS dw.mv_fact_broadcast
+TO dw.fact_broadcast AS
+SELECT
+  idEvent,
+  cityHash64(idChannel)                          AS channel_sk,
+  strEventCountry                                AS country,
+  dateEvent                                      AS event_date,
+  now64(3)                                       AS asof_ts
+FROM default.raw_daily_channel
+WHERE lowerUTF8(trim(strSport)) = 'soccer';
+
+/* ---------- fact_highlight MV ---------- */
+CREATE MATERIALIZED VIEW IF NOT EXISTS dw.mv_fact_highlight
+TO dw.fact_highlight AS
+SELECT
+  idEvent,
+  multiIf(strVideo IS NOT NULL AND strVideo != '', 'video',
+          strThumb IS NOT NULL AND strThumb != '', 'thumb',
+          strBanner IS NOT NULL AND strBanner != '', 'banner', 'asset') AS media_type,
+  coalesce(strVideo, strThumb, strBanner, '') AS url,
+  now64(3)                                    AS asof_ts
+FROM default.raw_event_highlights
+WHERE lowerUTF8(trim(strSport)) = 'soccer';
+
+
+/* ============================================================
+   4) HUB VIEW (latest row per event by updated_at)
+   Purpose: single source of truth for current event state.
+   Exposes scheduled_date for calendar joins in BI.
+   ============================================================ */
+CREATE OR REPLACE VIEW dw.v_fact_event_latest AS
+SELECT
+  idEvent,
+  argMax(league_sk,         updated_at) AS league_sk,
+  argMax(home_team_sk,      updated_at) AS home_team_sk,
+  argMax(away_team_sk,      updated_at) AS away_team_sk,
+  argMax(venue_sk,          updated_at) AS venue_sk,
+  argMax(season,            updated_at) AS season,
+  argMax(round,             updated_at) AS round,
+  argMax(status_final,      updated_at) AS status_final,
+  argMax(result,            updated_at) AS result,
+  argMax(strEvent,          updated_at) AS strEvent,
+  argMax(event_date,        updated_at) AS event_date,
+  argMax(scheduled_utc,     updated_at) AS scheduled_utc,
+  -- derive or take alias; both are fine
+  toDate(argMax(scheduled_utc, updated_at)) AS scheduled_date,
+  argMax(kickoff_local_utc, updated_at) AS kickoff_local_utc,
+  argMax(home_score,        updated_at) AS home_score,
+  argMax(away_score,        updated_at) AS away_score,
+  argMax(thumb_url,         updated_at) AS thumb_url,
+  max(updated_at) AS updated_at_latest,
+  max(created_at) AS created_at_latest
+FROM dw.fact_event
+GROUP BY idEvent;
+
+
+/* ============================================================
+   5) ONE-TIME BACKFILLS (run AFTER creating tables + MVs)
+   Purpose: seed DW from existing raw_* (soccer only).
+   If you also want MVs to backfill, DROP “WHERE … = 'soccer'”
+   here and instead create MVs with POPULATE (not recommended
+   since you’ve opted for manual backfill).
+   ============================================================ */
+
+-- Dimensions backfill
+INSERT INTO dw.dim_league
+( idLeague, strLeague, strLeagueAlternate, strSport, strCountry, strGender,
+  strCurrentSeason, intFormedYear, badge_url, logo_url, banner_url, updated_at )
+SELECT
+  idLeague, strLeague, strLeagueAlternate, strSport, strCountry, strGender,
+  strCurrentSeason, intFormedYear, strBadge, strLogo, strBanner, now64(3)
+FROM default.raw_league
+WHERE lowerUTF8(trim(strSport)) = 'soccer';
+
+INSERT INTO dw.dim_team
+( idTeam, strTeam, strTeamShort, country, league_ids, strStadium,
+  intStadiumCapacity, formed_year, website, badge_url, logo_url, banner_url, updated_at )
+SELECT
+  idTeam, strTeam, strTeamShort, strCountry,
+  [idLeague, idLeague2, idLeague3, idLeague4, idLeague5, idLeague6, idLeague7],
+  strStadium, intStadiumCapacity, intFormedYear, strWebsite, strBadge, strLogo, strBanner, now64(3)
+FROM default.raw_team
+WHERE lowerUTF8(trim(strSport)) = 'soccer';
+
+INSERT INTO dw.dim_player
+( idPlayer, idTeam, strPlayer, strNumber, strPosition, nationality,
+  dateBorn, thumb_url, cutout_url, updated_at )
+SELECT
+  idPlayer, idTeam, strPlayer, strNumber, strPosition, strNationality,
+  dateBorn, strThumb, strCutout, now64(3)
+FROM default.raw_player
+WHERE lowerUTF8(trim(strSport)) = 'soccer';
+
+INSERT INTO dw.dim_venue
+( idVenue, strVenue, strLocation, strCountry, intCapacity, strTimezone,
+  thumb_url, logo_url, map_url, updated_at )
+SELECT
+  idVenue, strVenue, strLocation, strCountry, intCapacity, strTimezone,
+  strThumb, strLogo, strMap, now64(3)
+FROM default.raw_venue
+WHERE lowerUTF8(trim(strSport)) = 'soccer';
+
+INSERT INTO dw.dim_channel
+( idChannel, strChannel, strCountry, strLogo, updated_at )
+SELECT
+  idChannel, anyLast(strChannel), anyLast(strCountry), anyLast(strLogo), now64(3)
+FROM default.raw_daily_channel
+WHERE lowerUTF8(trim(strSport)) = 'soccer' AND idChannel != 0
+GROUP BY idChannel;
+
+-- Facts backfill
+
+INSERT INTO dw.fact_event
+( idEvent, league_sk, home_team_sk, away_team_sk, venue_sk,
+  season, round, status_final, result, strEvent,
+  event_date, scheduled_utc, kickoff_local_utc,
+  home_score, away_score, thumb_url, created_at, updated_at )
+SELECT
+  idEvent,
+  cityHash64(idLeague),
+  cityHash64(idHomeTeam),
+  cityHash64(idAwayTeam),
+  if(ifNull(idVenue, 0)=0, NULL, cityHash64(idVenue)),
+  strSeason,
+  intRound,
+  strStatus,
+  strResult,
+  strEvent,
+  dateEvent,
+  coalesce(strTimestamp, toDateTime64(dateEvent, 9)),
+  CAST(NULL AS Nullable(DateTime64(9))),
+  intHomeScore,
+  intAwayScore,
+  strThumb,
+  now64(3),
+  now64(3)
+FROM default.raw_event
+WHERE lowerUTF8(trim(strSport)) = 'soccer';
+
+INSERT INTO dw.fact_event_snapshot
+SELECT
+  idEvent,
+  updated,
+  cityHash64(idLeague),
+  cityHash64(idHomeTeam),
+  cityHash64(idAwayTeam),
+  strStatus,
+  strProgress,
+  intHomeScore,
+  intAwayScore,
+  if(isNull(intHomeScore) OR isNull(intAwayScore), NULL, intHomeScore + intAwayScore)
+FROM default.raw_livescore
+WHERE lowerUTF8(trim(strSport)) = 'soccer';
+
+INSERT INTO dw.fact_event_stat
+SELECT s.idEvent, s.strStat, s.intHome, s.intAway, now64(3)
+FROM default.raw_event_stats s
+INNER JOIN default.raw_event e USING (idEvent)
+WHERE lowerUTF8(trim(e.strSport)) = 'soccer';
+
+INSERT INTO dw.fact_timeline
+SELECT
+  t.idTimeline, t.idEvent, t.intTime, t.strTimeline, t.strTimelineDetail,
+  if(t.idTeam = 0, NULL, cityHash64(t.idTeam)),
+  if(t.idPlayer = 0, NULL, cityHash64(t.idPlayer)),
+  if(t.idAssist = 0, NULL, cityHash64(t.idAssist)),
+  t.strComment, t.dateEvent, now64(3)
+FROM default.raw_event_timeline t
+INNER JOIN default.raw_event e USING (idEvent)
+WHERE lowerUTF8(trim(e.strSport)) = 'soccer';
+
+INSERT INTO dw.fact_lineup
+SELECT
+  l.idEvent, cityHash64(l.idTeam), cityHash64(l.idPlayer),
+  l.strPosition, l.strPositionShort,
+  if(lowerUTF8(trim(l.strSubstitute))='yes', 1, 0),
+  l.intSquadNumber, now64(3)
+FROM default.raw_event_lineup l
+INNER JOIN default.raw_event e USING (idEvent)
+WHERE lowerUTF8(trim(e.strSport)) = 'soccer';
+
+INSERT INTO dw.fact_broadcast
+SELECT
+  idEvent, cityHash64(idChannel), strEventCountry, dateEvent, now64(3)
+FROM default.raw_daily_channel
+WHERE lowerUTF8(trim(strSport)) = 'soccer';
+
+INSERT INTO dw.fact_highlight
+SELECT
+  idEvent,
+  multiIf(strVideo IS NOT NULL AND strVideo != '', 'video',
+          strThumb IS NOT NULL AND strThumb != '', 'thumb',
+          strBanner IS NOT NULL AND strBanner != '', 'banner', 'asset'),
+  coalesce(strVideo, strThumb, strBanner, ''),
+  now64(3)
+FROM default.raw_event_highlights
+WHERE lowerUTF8(trim(strSport)) = 'soccer';
