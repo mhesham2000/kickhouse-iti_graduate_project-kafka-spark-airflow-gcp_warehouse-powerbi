@@ -130,7 +130,7 @@ cat simpl   # press <TAB> twice to auto-complete the file name, then Enter
 # the password will appear
 ```
 
-**DAGs (from repo)**
+**DAGs**
 
 - **2‑minute loops**: `broadcast_dag`, `live_score_dag`, `event_lookup_dag` (task order: live_score → live_lookup)  Each uses **PythonOperator** and emails failures to `shinetym@gmail.com`.
 - **Nightly (00:00 Africa/Cairo)**: `venue_proucer_daily_dag`, `team_proucer_daily_dag`, `schedual_proucer_daily_dag`, `player_proucer_daily_dag`, `league_proucer_daily_dag`, `event_proucer_daily_dag`, `event_stats_daily_dag`.
@@ -202,7 +202,7 @@ docker logs -f spark-validator
 
 The steps below main purpose is to rebuild TLS material from zero and stand up one working **SASL_SSL** listener that `kcat` / ClickPipe can reach **directly via your own VM's public static IP**. The VM has to have a **reachable public static IP!** In my case, I used a GCP VM as an example. Adjust to your case accordingly
 
-**ClickPipes service** from ClickHouse Cloud needs the following setup in order to connect to your Kafka broker properly and subscribe to the topics. So make sure you get it right! **A technically better alternative** is to use a message broker service directly from any cloud provider instead of the local dockerized Kafka services, but where's the fun in that? :'D
+**ClickPipes service** from ClickHouse Cloud needs the following setup in order to connect to your Kafka broker properly and subscribe to the topics. So make sure you get it right! **A technically better alternative** is to use a message broker service directly from any cloud provider instead of the local dockerized Kafka services and setting up their certificates + exposing the IPs//ports, but where's the fun and learning experience in that? :'D
 
 Run each numbered block in order. Stop after any step that errors and keep the exact output.
 
@@ -366,7 +366,7 @@ KafkaServer {
 };
 ```
 
-### 9) Configure ClickPipe (or other clients)
+### 10) Configure ClickPipe (or other clients)
 
 - **Bootstrap:** `${GCP_PUBLIC_IP}:${KAFKA_SSL_PORT}`
 - **Protocol:** `SASL_SSL`
@@ -374,3 +374,80 @@ KafkaServer {
 - **Root CA:** upload `tsdb-ca.pem` (just the CA, *not* broker.pem)
 - Leave client-cert/key blank unless you enable mutual TLS.
 
+
+---
+
+### 11) ClickHouse Warehouse Setup — DDLs, MVs & One‑Time Backfill
+
+This section shows how to stand up the **DW schema** and seed it from the `default.raw_*` staging tables populated by ClickPipes. It uses the DDLs included in this repo: `ClickHouse Data Warehouse Creation + Backfill DDLs.txt` (create DB/tables/MVs/view + backfill statements).
+
+### A. Preconditions
+- ClickPipes (or your ingest job) writes **validated** rows into `default.raw_*` tables (soccer-only).
+- Your ClickHouse server/Cloud endpoint and credentials are ready.
+- You are OK with **ReplacingMergeTree** in staging and DW tables where we want **latest state per key**.
+
+### B. Run the DDLs (creates DB/tables/MVs/view)
+You can run the entire file in one go via **clickhouse-client** or via the **HTTP** interface.
+
+**Option 1 — clickhouse-client (secure connection)**
+```bash
+# rename the DDL file if you like; here we use the file as-is
+CLICKHOUSE_HOST="<your-hostname>"    # e.g. <cluster>.clickhouse.cloud
+CLICKHOUSE_PORT="9440"               # TLS port (cloud default)
+CLICKHOUSE_USER="<user>"
+CLICKHOUSE_PASSWORD="<password>"
+
+clickhouse client \
+  --host "$CLICKHOUSE_HOST" \
+  --secure \
+  --port "$CLICKHOUSE_PORT" \
+  --user "$CLICKHOUSE_USER" \
+  --password "$CLICKHOUSE_PASSWORD" \
+  --multiquery < "ClickHouse Data Warehouse Creation + Backfill DDLs.txt"
+```
+
+**Option 2 — HTTP (curl)**
+```bash
+CLICKHOUSE_HTTP="https://<your-hostname>:443"   # adjust port if needed
+curl -sS -u "$CLICKHOUSE_USER:$CLICKHOUSE_PASSWORD" \
+  --data-binary @"ClickHouse Data Warehouse Creation + Backfill DDLs.txt" \
+  "$CLICKHOUSE_HTTP/?database=default&enable_sql_parser=1"
+```
+
+> The script will: create `dw` database; create **dimensions** (Type‑1 SCD via ReplacingMergeTree on `updated_at`), **facts**, **materialized views** from `default.raw_*`, a **hub view** (`dw.v_fact_event_latest`), and **one-time backfills**.
+
+### C. Modeling highlights (what the script implements)
+- **Dimensions**: `dw.dim_league`, `dw.dim_team`, `dw.dim_player`, `dw.dim_venue`, `dw.dim_channel` (Type‑1 SCD with `ReplacingMergeTree(updated_at)`; deterministic `*_sk` via `cityHash64` on natural keys).
+- **Facts**: event, snapshot, stat, timeline, lineup, broadcast, highlight (append-friendly MergeTrees; `fact_event` uses a **SharedReplacingMergeTree** so the **latest** row per event wins by `updated_at`).
+- **Views**: `dw.v_fact_event_latest` provides **latest state per event** using `argMax` by `updated_at`, exposing `scheduled_date` for calendar joins.
+- **MVs**: all `dw.mv_*` stream **soccer-only** rows from `default.raw_*` into the DW tables. (If you later change SELECT lists, drop & recreate the respective MV.)
+
+### D. One‑time backfill
+The DDL file includes **INSERT … SELECT** statements to seed the DW from existing `default.raw_*` (soccer scope). Run the whole file once; future updates will arrive via the MVs automatically.
+
+### E. Verifications
+```sql
+-- counts after backfill
+SELECT count() FROM dw.dim_league;
+SELECT count() FROM dw.dim_team;
+SELECT count() FROM dw.fact_event;
+
+-- latest-per-event sanity
+SELECT idEvent, home_score, away_score, updated_at_latest
+FROM dw.v_fact_event_latest
+ORDER BY updated_at_latest DESC
+LIMIT 10;
+
+-- soccer-only constraint example
+SELECT DISTINCT lowerUTF8(trim(strSport)) FROM default.raw_event;
+```
+
+### F. Power BI DirectQuery targets
+For fresh visuals, point DirectQuery to:
+- `dw.v_fact_event_latest` (latest factual state)
+- `dw.dim_league`, `dw.dim_team`, `dw.dim_player`, `dw.dim_venue`, `dw.dim_channel`
+For historical deep dives, use `dw.fact_event_snapshot`, `dw.fact_event_stat`, etc.
+
+### G. Why ReplacingMergeTree here?
+- In **staging** (raw) and in **dw.fact_event**/**dims**, `ReplacingMergeTree` (with proper `ORDER BY` and a version column like `updated_at`) lets merges keep the **latest state per key** without expensive batch dedup jobs—ideal for live scores and evolving event details.
+- Use `FINAL` judiciously on very small tables; prefer **views/MVs** (like `v_fact_event_latest`) for “latest” semantics on bigger ones.
