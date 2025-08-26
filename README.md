@@ -53,6 +53,10 @@ This repo ingests **TheSportsDB v2** soccer data into Kafka via Python producers
 > **Ports**: Airflow UI → `http://localhost:9050`, Grafana → `http://localhost:3000`
 
 ---
+![Diagram](https://github.com/mhesham2000/kickhouse-iti_graduate_project-kafka-spark-airflow-gcp_warehouse-powerbi/blob/4d62bbc5b957518075c7e1b0536fe52e765e4705/postgres/WhatsApp%20Image%202025-08-26%20at%2018.44.52_facb3c9c.jpg)
+
+
+--- 
 
 ## 1) Kafka + Python Producers (Section 1)
 
