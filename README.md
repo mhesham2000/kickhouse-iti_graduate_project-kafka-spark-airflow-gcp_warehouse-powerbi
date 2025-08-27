@@ -140,10 +140,23 @@ cat simpl   # press <TAB> twice to auto-complete the file name, then Enter
 - **Nightly (00:00 Africa/Cairo)**: `venue_proucer_daily_dag`, `team_proucer_daily_dag`, `schedual_proucer_daily_dag`, `player_proucer_daily_dag`, `league_proucer_daily_dag`, `event_proucer_daily_dag`, `event_stats_daily_dag`.
 - **Triage (06:00)**: `save_rejected_topics_as_parquet_daily` — **BashOperator** running `python /opt/airflow/scripts/consume_kafka.py`, producing Parquet under `airflow/dags/data/kafka_invalid/` for Grafana/analysis.
 
+**Alerting when there an error on pipeline via email detecting where is the problem**
+![Image](https://github.com/mhesham2000/kickhouse-iti_graduate_project-kafka-spark-airflow-gcp_warehouse-powerbi/blob/enhance/dashboards/admin/Screenshot%202025-08-14%20105254.png?raw=true)
+
 **Grafana**
 
 - Comes up via compose on **`http://localhost:3000`**. SMTP creds/alerts are configured in compose (redact real values before commit if needed).
+- used for stream live matches stats 
+![Image](https://github.com/mhesham2000/kickhouse-iti_graduate_project-kafka-spark-airflow-gcp_warehouse-powerbi/blob/enhance/dashboards/live/WhatsApp%20Image%202025-08-28%20at%2001.45.36_0cdd3329.jpg?raw=true)
+
 - Point panels to the daily Parquet (`/opt/airflow/dags/data/kafka_invalid/*.parquet`) or to Prometheus if you enable exporters.
+
+![Image](https://github.com/mhesham2000/kickhouse-iti_graduate_project-kafka-spark-airflow-gcp_warehouse-powerbi/blob/enhance/dashboards/admin/Screenshot%202025-08-14%20164818.png?raw=true)
+![Image](https://github.com/mhesham2000/kickhouse-iti_graduate_project-kafka-spark-airflow-gcp_warehouse-powerbi/blob/enhance/dashboards/admin/Screenshot%202025-08-14%20171655.png?raw=true)
+
+**Alerting when there an invalid data via email**
+
+![Image](https://github.com/mhesham2000/kickhouse-iti_graduate_project-kafka-spark-airflow-gcp_warehouse-powerbi/blob/enhance/dashboards/admin/Screenshot%202025-08-14%20070706.png?raw=true)
 
 ---
 
@@ -451,6 +464,13 @@ For fresh visuals, point DirectQuery to:
 - `dw.v_fact_event_latest` (latest factual state)
 - `dw.dim_league`, `dw.dim_team`, `dw.dim_player`, `dw.dim_venue`, `dw.dim_channel`
 For historical deep dives, use `dw.fact_event_snapshot`, `dw.fact_event_stat`, etc.
+
+![Image](https://github.com/mhesham2000/kickhouse-iti_graduate_project-kafka-spark-airflow-gcp_warehouse-powerbi/blob/enhance/dashboards/powerbi/WhatsApp%20Image%202025-08-28%20at%2001.30.14_8f06fbba.jpg?raw=true)
+![Image](https://github.com/mhesham2000/kickhouse-iti_graduate_project-kafka-spark-airflow-gcp_warehouse-powerbi/blob/enhance/dashboards/powerbi/WhatsApp%20Image%202025-08-28%20at%2001.30.15_6e13fdba.jpg?raw=true)
+![Image](https://github.com/mhesham2000/kickhouse-iti_graduate_project-kafka-spark-airflow-gcp_warehouse-powerbi/blob/enhance/dashboards/powerbi/WhatsApp%20Image%202025-08-28%20at%2001.30.15_d0175954.jpg?raw=true)
+![Image](https://github.com/mhesham2000/kickhouse-iti_graduate_project-kafka-spark-airflow-gcp_warehouse-powerbi/blob/enhance/dashboards/powerbi/WhatsApp%20Image%202025-08-28%20at%2001.30.16_d3525921.jpg?raw=true)
+![Image](https://github.com/mhesham2000/kickhouse-iti_graduate_project-kafka-spark-airflow-gcp_warehouse-powerbi/blob/enhance/dashboards/powerbi/WhatsApp%20Image%202025-08-28%20at%2001.30.17_a5e875da.jpg?raw=true)
+![Image](https://github.com/mhesham2000/kickhouse-iti_graduate_project-kafka-spark-airflow-gcp_warehouse-powerbi/blob/enhance/dashboards/powerbi/WhatsApp%20Image%202025-08-28%20at%2001.30.20_09ab55b0.jpg?raw=true)
 
 ### G. Why ReplacingMergeTree here?
 - In **staging** (raw) and in **dw.fact_event**/**dims**, `ReplacingMergeTree` (with proper `ORDER BY` and a version column like `updated_at`) lets merges keep the **latest state per key** without expensive batch dedup jobs—ideal for live scores and evolving event details.
